@@ -1,10 +1,11 @@
 import copy
 from typing import Callable, Tuple
+import pickle
 
 import cvxpy as cp
 import numpy as np
 from scipy import io
-from scipy.linalg import eigh_tridiagonal
+from scipy.linalg import eigh_tridiagonal, pinv
 from scipy.sparse import csgraph, csc_matrix, coo_matrix
 #from tqdm import trange
 
@@ -20,7 +21,7 @@ def solve_maxcut_slow(L: csc_matrix) -> np.array:
     prob = cp.Problem(cp.Maximize(cp.trace(L @ X)),
                       [cp.diag(X) == np.ones((n,))])
     prob.solve(solver=cp.SCS, verbose=True)
-    return 2*(np.linalg.svd(X.value)[0][:,0] > 0).astype(float) - 1
+    return X.value
 
 
 def approx_min_eigen(
@@ -46,18 +47,18 @@ def approx_min_eigen(
         if i > 0:
             V[i+1] -= (rhos[i-1] * V[i-1])
         rhos[i] = np.linalg.norm(V[i+1])
-        if rhos[i] < np.sqrt(n)*EPS: 
+        if rhos[i] < np.sqrt(n) * EPS: 
             break
         V[i+1] = V[i+1] / rhos[i]
 
-    try:
-        eigen_val, u = eigh_tridiagonal(
-                omegas[:i+1], rhos[:i], select='i', select_range=(0, 0))
-    except:
-        embed()
-        exit()
+    eigen_val, u = eigh_tridiagonal(
+            omegas[:i+1], rhos[:i], select='i', select_range=(0, 0))
+    eigen_vec = (u.T @ V[:i+1]).squeeze()
 
-    return eigen_val, (u.T @ V[:i+1]).squeeze()
+    # renormalize for stability
+    eigen_vec = eigen_vec / np.linalg.norm(eigen_vec)
+
+    return eigen_val, eigen_vec
 
 
 def reconstruct(Omega: np.array, S: np.array) -> Tuple[np.array, np.array]:
@@ -74,19 +75,19 @@ def reconstruct(Omega: np.array, S: np.array) -> Tuple[np.array, np.array]:
 def solve_maxcut_sketchyfast(laplacian: csc_matrix, R: int, T: int
         ) -> np.array:
 
-    #C = (-0.25) * laplacian
     C = (-1.0) * laplacian
     n = laplacian.shape[0]
     b = np.ones((n,))
+    alpha = n
 
-    ## scaling params
-    scale_C = 1.0/np.linalg.norm(C.data) # equivalent to frobenius norm
-    scale_X = 1.0/n
+    ### scaling params
+    #scale_C = 1.0/np.linalg.norm(C.data) # equivalent to frobenius norm
+    #scale_X = 1.0/n
 
-    b *= scale_X
+    #b *= scale_X
 
     # define the primitives
-    objective_primitive = lambda u: (C @ u) * scale_C
+    objective_primitive = lambda u: (C @ u)
     adjoint_constraint_primitive = lambda u, z: u * z
     constraint_primitive = lambda u: u * u
 
@@ -111,11 +112,11 @@ def solve_maxcut_sketchyfast(laplacian: csc_matrix, R: int, T: int
         )
 
         # update state variables
-        z = (1-eta) * z + eta * constraint_primitive(eigen_vec)
-        gamma = 4 / (((t + 2)**(3/2)) * (np.linalg.norm(z - b)**2))
+        z = (1-eta) * z + eta * alpha * constraint_primitive(eigen_vec)
+        gamma = np.clip((4 * alpha**2) / (((t + 2)**(3/2)) * (np.linalg.norm(z - b)**2)), 0, 1)
         y = y + gamma * (z-b)
-        S = (1-eta) * S + eta * (eigen_vec[:,None]
-                                 @ (eigen_vec[None,:] @ Omega))
+        S = (1-eta) * S + eta * alpha * (eigen_vec[:,None]
+                                         @ (eigen_vec[None,:] @ Omega))
 
         #print(eigen_vec)
         #print(constraint_primitive(eigen_vec))
@@ -126,22 +127,34 @@ def solve_maxcut_sketchyfast(laplacian: csc_matrix, R: int, T: int
         # for tracking
         infeas = z - b
         obj_val = (1-eta) * obj_val \
-                + eta * np.dot(eigen_vec, objective_primitive(eigen_vec))
-        dual_gap = (obj_val + np.dot(y + beta * (infeas), z) - eigen_val).squeeze()
+                + eta * alpha * np.dot(eigen_vec, objective_primitive(eigen_vec))
+        dual_gap = (obj_val + np.dot(y + beta * (infeas), z).squeeze() - eigen_val * alpha).squeeze()
         sub_opt = dual_gap - np.dot(y, infeas) \
                 - 0.5*beta*(np.linalg.norm(infeas)**2)
 
         if t % 100 == 0:
             print('t = ', t)
-            print('infeas = ', np.linalg.norm(infeas, ord=1))
+            print('infeas = ', np.linalg.norm(infeas))
             print('obj val = ', obj_val)
             print('dual gap = ', dual_gap)
             print('sub opt = ', sub_opt)
             print()
 
 
+    # reconstruct matrix
     U, Lambda = reconstruct(Omega, S)
-    return 2*(U[:, 0] > 0).astype(float) - 1
+
+    embed()
+    exit()
+
+    # trace correction
+    Lambda = Lambda + (alpha - np.sum(Lambda)) / R
+
+    X_hat_1 = (U * Lambda[None, :]) @ U.T
+
+    X_hat_2 = S @ pinv(Omega.T @ S) @ S.T
+    
+    return X_hat_2
     
 
 if __name__ == '__main__':
@@ -164,20 +177,17 @@ if __name__ == '__main__':
     laplacian = csgraph.laplacian(graph, normed=False).tocsc()
 
     ## slow maxcut
-    #pred_cut = solve_maxcut_slow(laplacian)
-    #cut_size = (pred_cut[None,:] @ laplacian @ pred_cut[:, None]).item() / 4
-    ## --> cut_size for G1.mat is 11,425
+    #X_slow = solve_maxcut_slow(laplacian)
 
-    #print('slow cut size = ', cut_size)
-
+    with open('X_slow.pkl', 'rb') as f:
+        X_slow = pickle.load(f)
 
     # fast maxcut
     R = 10
-    T = 15000
-    pred_cut = solve_maxcut_sketchyfast(laplacian, R, T)
-    cut_size = (pred_cut[None,:] @ laplacian @ pred_cut[:, None]).item() / 4
-
-    print('fast cut size = ', cut_size)
+    T = int(1e4)
+    X_fast = solve_maxcut_sketchyfast(laplacian, R, T)
 
     embed()
     exit()
+
+    #cut_size = (pred_cut[None,:] @ laplacian @ pred_cut[:, None]).item() / 4
