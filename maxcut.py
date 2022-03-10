@@ -63,19 +63,24 @@ def approx_min_eigen(
 
 def reconstruct(Omega: np.array, S: np.array) -> Tuple[np.array, np.array]:
     n = Omega.shape[0]
-    sigma = np.sqrt(n) * EPS * np.linalg.norm(S)
+    sigma = np.sqrt(n) * EPS    # maybe this isn't right?
+    sigma = 0
     S_sigma = S + sigma * Omega
-    B = Omega.T @ S
+    B = Omega.T @ S_sigma
+    B = 0.5 * (B + B.T)
     L = np.linalg.cholesky(B)
-    U, Sigma, _ = np.linalg.svd(S_sigma @ np.linalg.inv(L), full_matrices=False)
-    Lambda = np.clip(Sigma - sigma, 0, np.inf)
+    U, Sigma, _ = np.linalg.svd(
+            np.linalg.lstsq(L.T, S_sigma.T, rcond=None)[0].T,
+            full_matrices=False # this compresses the output to be rank `R`
+    )
+    Lambda = np.clip(Sigma**2 - sigma, 0, np.inf)
     return U, Lambda
 
 
 def solve_maxcut_sketchyfast(laplacian: csc_matrix, R: int, T: int
         ) -> np.array:
 
-    C = (-1.0) * laplacian
+    C = (-0.25) * laplacian
     n = laplacian.shape[0]
     b = np.ones((n,))
     alpha = n
@@ -144,16 +149,16 @@ def solve_maxcut_sketchyfast(laplacian: csc_matrix, R: int, T: int
     # reconstruct matrix
     U, Lambda = reconstruct(Omega, S)
 
-    embed()
-    exit()
-
     # trace correction
-    Lambda = Lambda + (alpha - np.sum(Lambda)) / R
+    Lambda_tr_correct = Lambda + (alpha - np.sum(Lambda)) / R
 
-    X_hat_1 = (U * Lambda[None, :]) @ U.T
+    X_hat_1 = (U * Lambda_tr_correct[None, :]) @ U.T
 
     X_hat_2 = S @ pinv(Omega.T @ S) @ S.T
     
+    embed()
+    exit()
+
     return X_hat_2
     
 
@@ -183,8 +188,9 @@ if __name__ == '__main__':
         X_slow = pickle.load(f)
 
     # fast maxcut
-    R = 10
-    T = int(1e4)
+    R = 800
+    #T = int(5e4)
+    T = 5000
     X_fast = solve_maxcut_sketchyfast(laplacian, R, T)
 
     embed()
