@@ -63,14 +63,13 @@ def approx_min_eigen(
 
 def reconstruct(Omega: np.array, S: np.array) -> Tuple[np.array, np.array]:
     n = Omega.shape[0]
-    sigma = np.sqrt(n) * EPS    # maybe this isn't right?
-    sigma = 0
+    sigma = np.sqrt(n) * EPS * np.linalg.norm(S, ord=2)
     S_sigma = S + sigma * Omega
     B = Omega.T @ S_sigma
     B = 0.5 * (B + B.T)
     L = np.linalg.cholesky(B)
     U, Sigma, _ = np.linalg.svd(
-            np.linalg.lstsq(L.T, S_sigma.T, rcond=None)[0].T,
+            np.linalg.lstsq(L, S_sigma.T, rcond=-1)[0].T,
             full_matrices=False # this compresses the output to be rank `R`
     )
     Lambda = np.clip(Sigma**2 - sigma, 0, np.inf)
@@ -80,7 +79,7 @@ def reconstruct(Omega: np.array, S: np.array) -> Tuple[np.array, np.array]:
 def solve_maxcut_sketchyfast(laplacian: csc_matrix, R: int, T: int
         ) -> np.array:
 
-    C = (-0.25) * laplacian
+    C = -1.0 * laplacian
     n = laplacian.shape[0]
     b = np.ones((n,))
     alpha = n
@@ -145,7 +144,6 @@ def solve_maxcut_sketchyfast(laplacian: csc_matrix, R: int, T: int
             print('sub opt = ', sub_opt)
             print()
 
-
     # reconstruct matrix
     U, Lambda = reconstruct(Omega, S)
 
@@ -188,9 +186,8 @@ if __name__ == '__main__':
         X_slow = pickle.load(f)
 
     # fast maxcut
-    R = 800
-    #T = int(5e4)
-    T = 5000
+    R = 250
+    T = int(2e4)
     X_fast = solve_maxcut_sketchyfast(laplacian, R, T)
 
     embed()
