@@ -12,7 +12,13 @@ from scipy.sparse import csgraph, csc_matrix, coo_matrix
 from IPython import embed
 
 
-EPS = 1e-4
+APPROX_EPS = 1e-4   # for numerical operations
+CONVERGE_EPS = 1e-1 # for measuring convergence
+
+
+def get_cut_size(L: csc_matrix, pred_cut: np.array) -> int:
+    cut_size = (pred_cut[None,:] @ L @ pred_cut[:, None]).item() / 4
+    return int(cut_size)
 
 
 def solve_maxcut_slow(L: csc_matrix) -> np.array:
@@ -20,7 +26,7 @@ def solve_maxcut_slow(L: csc_matrix) -> np.array:
     X = cp.Variable((n, n), PSD=True)
     prob = cp.Problem(cp.Maximize(cp.trace(L @ X)),
                       [cp.diag(X) == np.ones((n,))])
-    prob.solve(solver=cp.SCS, verbose=True)
+    prob.solve(solver=cp.SCS, verbose=True, eps=CONVERGE_EPS)
     return X.value
 
 
@@ -47,7 +53,7 @@ def approx_min_eigen(
         if i > 0:
             V[i+1] -= (rhos[i-1] * V[i-1])
         rhos[i] = np.linalg.norm(V[i+1])
-        if rhos[i] < np.sqrt(n) * EPS: 
+        if rhos[i] < np.sqrt(n) * APPROX_EPS: 
             break
         V[i+1] = V[i+1] / rhos[i]
 
@@ -63,7 +69,7 @@ def approx_min_eigen(
 
 def reconstruct(Omega: np.array, S: np.array) -> Tuple[np.array, np.array]:
     n = Omega.shape[0]
-    sigma = np.sqrt(n) * EPS * np.linalg.norm(S, ord=2)
+    sigma = np.sqrt(n) * APPROX_EPS * np.linalg.norm(S, ord=2)
     S_sigma = S + sigma * Omega
     B = Omega.T @ S_sigma
     B = 0.5 * (B + B.T)
@@ -84,11 +90,13 @@ def solve_maxcut_sketchyfast(laplacian: csc_matrix, R: int, T: int
     b = np.ones((n,))
     alpha = n
 
-    ### scaling params
-    #scale_C = 1.0/np.linalg.norm(C.data) # equivalent to frobenius norm
-    #scale_X = 1.0/n
+    ## scaling params
+    scale_C = 1.0/np.linalg.norm(C.data) # equivalent to frobenius norm
+    scale_X = 1.0/n
 
-    #b *= scale_X
+    C *= scale_C
+    b *= scale_X
+    alpha *= scale_X
 
     # define the primitives
     objective_primitive = lambda u: (C @ u)
@@ -144,23 +152,22 @@ def solve_maxcut_sketchyfast(laplacian: csc_matrix, R: int, T: int
             print('sub opt = ', sub_opt)
             print()
 
+        if np.linalg.norm(infeas) < CONVERGE_EPS and sub_opt < CONVERGE_EPS:
+            break
+
     # reconstruct matrix
     U, Lambda = reconstruct(Omega, S)
 
     # trace correction
     Lambda_tr_correct = Lambda + (alpha - np.sum(Lambda)) / R
 
-    X_hat_1 = (U * Lambda_tr_correct[None, :]) @ U.T
-
-    X_hat_2 = S @ pinv(Omega.T @ S) @ S.T
-    
-    embed()
-    exit()
-
-    return X_hat_2
+    return U
     
 
 if __name__ == '__main__':
+
+    R = 100
+    T = int(1e4)
 
     np.random.seed(42)
 
@@ -184,11 +191,20 @@ if __name__ == '__main__':
 
     with open('X_slow.pkl', 'rb') as f:
         X_slow = pickle.load(f)
+    U_slow, _, _ = np.linalg.svd(X_slow)
 
     # fast maxcut
-    R = 250
-    T = int(2e4)
-    X_fast = solve_maxcut_sketchyfast(laplacian, R, T)
+    U_fast = solve_maxcut_sketchyfast(laplacian, R, T)
+
+    for i in range(R):
+        pred_cut = 2 * (U_slow[:, i] > 0).astype(float) - 1
+        cut_size = get_cut_size(laplacian, pred_cut)
+        print('slow cut size: ', cut_size)
+
+    for i in range(R):
+        pred_cut = 2 * (U_fast[:, i] > 0).astype(float) - 1
+        cut_size = get_cut_size(laplacian, pred_cut)
+        print('fast cut size: ', cut_size)
 
     embed()
     exit()
