@@ -100,7 +100,10 @@ def sketchy_cgal(
         R: int,
         T: int,
         soln_quality_callback: Callable[[np.ndarray, np.array], int],
-        eval_freq: int) -> np.array:
+        eval_freq: int,
+        warm_start_mode: str) -> np.array:
+
+    assert warm_start_mode in ['none', 'just_data', 'static', 'dynamic']
 
     n = z.shape[0]
 
@@ -109,9 +112,19 @@ def sketchy_cgal(
 
     start_time = time.time()
 
-    for t in range(T):
+    if warm_start_mode == 'none':
+        t_0 = 0
+    elif warm_start_mode == 'just_data':
+        t_0 = 1
+    else:
+        t_0 = 2
+
+    for t in range(t_0, T):
         sigma = sigma_init * np.sqrt(t + 2)
         eta = 2 / (t + 2.0)
+
+        if warm_start_mode == 'static':
+            sigma = 51
 
         state_vec = y + sigma * (z-b)
         adjoint_closure = lambda u: adjoint_constraint_primitive(u, state_vec)
@@ -142,6 +155,10 @@ def sketchy_cgal(
         )
         best_obj_lb = np.max([obj_lb, best_obj_lb])
         lb_gap = aug_lagrangian - best_obj_lb
+
+        if warm_start_mode == 'static':
+            embed()
+            exit()
 
         if (t > 0 and t % eval_freq == 0) or (lb_gap < CONVERGE_EPS
                 and np.linalg.norm(infeas, 2) < CONVERGE_EPS):
@@ -186,7 +203,8 @@ def sketchy_cgal(
             'time': time.time() - start_time,
             'lb_gap': lb_gap,
             'infeas': np.linalg.norm(infeas, 2),
-            'soln_quality': soln_quality
+            'soln_quality': soln_quality,
+            'sigma': sigma,
     }
 
     return result_dict
@@ -206,6 +224,10 @@ def get_hparams():
     parser.add_argument('--warm_start_data_frac', type=float, default=0.8,
                         help="fraction of data to warm start with")
     parser.add_argument('--test_data_frac', type=float, default=1.0,
+                        help="fraction of data to use to test warm start")
+
+    parser.add_argument('--warm_start_mode', type=str, default='just_data',
+                        choices=['none', 'just_data', 'static', 'dynamic'],
                         help="fraction of data to use to test warm start")
 
     hparams = parser.parse_args()
@@ -290,7 +312,8 @@ if __name__ == '__main__':
             R,
             T,
             soln_quality_callback,
-            eval_freq
+            eval_freq,
+            warm_start_mode='none'
     )
 
     if hparams.test_data_frac == hparams.warm_start_data_frac:
@@ -322,22 +345,29 @@ if __name__ == '__main__':
     adjoint_constraint_primitive = lambda u, z: u * z
     constraint_primitive = lambda u: u * u
 
-    U = np.zeros((test_n, R))
-    U[:warm_start_n, :] = warm_start_result_dict['U']
-    Lambda = warm_start_result_dict['Lambda']
-
-    X_factorized = U * np.sqrt(Lambda)[None, :]
-
+    # initialize everything
     Omega = np.random.normal(size=(test_n, R))
-    S = X_factorized @ (X_factorized.T @ Omega)
-    z = np.sum(X_factorized * X_factorized, axis=1)
-    y = np.zeros((test_n,))
-    y[:warm_start_n] = warm_start_result_dict['y']
+    if hparams.warm_start_mode == 'none':
+        S = np.zeros((test_n, R))
+        z = np.zeros((test_n,))
+        y = np.zeros((test_n,))
+        obj_val = 0.0
+    else:
+        U = np.zeros((test_n, R))
+        U[:warm_start_n, :] = warm_start_result_dict['U']
+        Lambda = warm_start_result_dict['Lambda']
 
-    obj_val = np.trace(X_factorized.T @ (C @ X_factorized))
+        X_factorized = U * np.sqrt(Lambda)[None, :]
+
+        S = X_factorized @ (X_factorized.T @ Omega)
+        z = np.sum(X_factorized * X_factorized, axis=1)
+        y = np.zeros((test_n,))
+        y[:warm_start_n] = warm_start_result_dict['y']
+
+        obj_val = np.trace(X_factorized.T @ (C @ X_factorized))
 
     # get test result
-    warm_start_result_dict = sketchy_cgal(
+    test_result_dict = sketchy_cgal(
             S,
             Omega,
             z,
@@ -350,5 +380,6 @@ if __name__ == '__main__':
             R,
             T,
             soln_quality_callback,
-            eval_freq
+            eval_freq,
+            warm_start_mode=hparams.warm_start_mode
     )
