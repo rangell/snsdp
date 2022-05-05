@@ -151,11 +151,10 @@ def sketchy_cgal(
                     - tau * (sigma_init / sigma)
                         * np.max([np.abs(min_eigen_val), np.abs(max_eigen_val)])
             )
-            #obj_lb = obj_val - sub_opt
             if t > 0:
                 best_obj_lb = np.max([obj_lb, best_obj_lb])
             else:
-                best_obj_lb = obj_lb
+                best_obj_lb = np.max([obj_lb])
             lb_gap = aug_lagrangian - best_obj_lb
 
             if warm_start_mode in ['none', 'just_data']:
