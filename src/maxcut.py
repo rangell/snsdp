@@ -113,56 +113,73 @@ def sketchy_cgal(
     start_time = time.time()
 
     if warm_start_mode == 'none':
-        t_0 = 0
+        step_num = 0.0
     elif warm_start_mode == 'just_data':
-        t_0 = 1
+        step_num = 1.0
     else:
-        t_0 = 2
+        step_num = 2.0
 
-    for t in range(t_0, T):
-        sigma = sigma_init * np.sqrt(t + 2)
-        eta = 2 / (t + 2.0)
+    for t in range(T):
+        sigma = sigma_init * np.sqrt(step_num + 2)
 
-        if warm_start_mode == 'static':
-            sigma = 51
+        # determine eta and sigma (step-size and smoothing parameters)
+        while True:
+            state_vec = y + sigma * (z-b)
+            adjoint_closure = lambda u: adjoint_constraint_primitive(u, state_vec)
+            num_iters = int(np.ceil((step_num+1)**(1/4) * np.log(n)))
 
-        state_vec = y + sigma * (z-b)
-        adjoint_closure = lambda u: adjoint_constraint_primitive(u, state_vec)
-        num_iters = int(np.ceil((t+1)**(1/4) * np.log(n)))
+            # compute primal update direction via randomized Lanczos
+            min_eigen_val, min_eigen_vec, max_eigen_val, _ = approx_extreme_eigen(
+                    objective_primitive, adjoint_closure, n, num_iters
+            )
+            h = tau * constraint_primitive(min_eigen_vec)
+            obj_update = tau * np.dot(min_eigen_vec,
+                                      objective_primitive(min_eigen_vec))
 
-        # compute primal update direction via randomized Lanczos
-        min_eigen_val, min_eigen_vec, max_eigen_val, _ = approx_extreme_eigen(
-                objective_primitive, adjoint_closure, n, num_iters
-        )
-        h = tau * constraint_primitive(min_eigen_vec)
-        obj_update = tau * np.dot(min_eigen_vec,
-                                  objective_primitive(min_eigen_vec))
+            # compute objective tracking metrics
+            infeas = z - b
+            dual_gap = (obj_val + np.dot(y + sigma * (infeas), z).squeeze()
+                        - min_eigen_val).squeeze()
+            sub_opt = dual_gap - np.dot(y, infeas) \
+                    - 0.5*sigma*(np.linalg.norm(infeas)**2)
+            aug_lagrangian = (obj_val + np.dot(y, infeas)
+                              + 0.5*sigma*(np.linalg.norm(infeas)**2))
+            obj_lb = (
+                    aug_lagrangian
+                    + obj_update - obj_val + np.dot(y + sigma * (infeas), h - z)
+                    + 0.5*sigma*(np.linalg.norm(infeas)**2)
+                    - tau * (sigma_init / sigma)
+                        * np.max([np.abs(min_eigen_val), np.abs(max_eigen_val)])
+            )
+            best_obj_lb = np.max([obj_lb, best_obj_lb])
+            lb_gap = aug_lagrangian - best_obj_lb
 
-        # compute objective tracking metrics
-        infeas = z - b
-        dual_gap = (obj_val + np.dot(y + sigma * (infeas), z).squeeze()
-                    - min_eigen_val * tau).squeeze()
-        sub_opt = dual_gap - np.dot(y, infeas) \
-                - 0.5*sigma*(np.linalg.norm(infeas)**2)
-        aug_lagrangian = (obj_val + np.dot(y, infeas)
-                          + 0.5*sigma*(np.linalg.norm(infeas)**2))
-        obj_lb = (
-                aug_lagrangian
-                + obj_update - obj_val + np.dot(y + sigma * (infeas), h - z)
-                + 0.5*sigma*(np.linalg.norm(infeas)**2)
-                - tau * (sigma_init / sigma)
-                    * np.max([np.abs(min_eigen_val), np.abs(max_eigen_val)])
-        )
-        best_obj_lb = np.max([obj_lb, best_obj_lb])
-        lb_gap = aug_lagrangian - best_obj_lb
+            if warm_start_mode in ['none', 'just_data']:
+                break
+            if warm_start_mode == 'static' and t > 0:
+                break
 
-        if warm_start_mode == 'static':
-            embed()
-            exit()
+            # binary search for sigma here
+            approx_step_num = 4 / sub_opt
+
+            # can never go back in time
+            if approx_step_num < step_num:
+                break
+            
+            approx_sigma = sigma_init * np.sqrt(approx_step_num + 2)
+            sigma_gap = np.abs(approx_sigma - sigma)
+            sigma += (approx_sigma - sigma) / 2
+
+            if warm_start_mode in ['static', 'dynamic'] and sigma_gap < 1e-2:
+                step_num = approx_step_num
+                embed()
+                exit()
+                break
 
         if (t > 0 and t % eval_freq == 0) or (lb_gap < CONVERGE_EPS
                 and np.linalg.norm(infeas, 2) < CONVERGE_EPS):
             print('t = ', t)
+            print('step_num = ', step_num)
             print('infeas = ', np.linalg.norm(infeas, 2))
             print('obj val = ', obj_val)
             print('dual gap = ', dual_gap)
@@ -184,14 +201,20 @@ def sketchy_cgal(
                     and np.linalg.norm(infeas, 2) < CONVERGE_EPS):
                 break
 
+        eta = 2 / (step_num + 2.0)
+
         # update state variables
         z = (1-eta) * z + eta * h 
-        gamma = np.clip((4 * tau**2) / (((t + 2)**(3/2)) * (np.linalg.norm(z - b)**2)), 0, 1)
+        gamma = np.clip((4 * tau**2) / (((step_num + 2)**(3/2)) * (np.linalg.norm(z - b)**2)), 0, 1)
         y = y + gamma * (z-b)
         S = (1-eta) * S + eta * tau * (min_eigen_vec[:,None]
                                          @ (min_eigen_vec[None,:] @ Omega))
         # update running objective
         obj_val = (1-eta) * obj_val + eta * obj_update 
+
+        # increment step number
+        step_num += 1
+
 
     result_dict = {
             'U': U,
@@ -264,6 +287,8 @@ if __name__ == '__main__':
 
     n = graph.shape[0]
 
+    Omega = np.random.normal(size=(n, R))
+
     # prepare warm start 
     warm_start_n = int(hparams.warm_start_data_frac * n)
     warm_start_graph = graph[:warm_start_n, :warm_start_n]
@@ -291,7 +316,6 @@ if __name__ == '__main__':
     constraint_primitive = lambda u: u * u
 
     # initialize everything
-    Omega = np.random.normal(size=(warm_start_n, R))
     S = np.zeros((warm_start_n, R))
     z = np.zeros((warm_start_n,))
     y = np.zeros((warm_start_n,))
@@ -301,7 +325,7 @@ if __name__ == '__main__':
     # get warm-start result
     warm_start_result_dict = sketchy_cgal(
             S,
-            Omega,
+            Omega[:warm_start_n,:],
             z,
             b,
             y,
@@ -346,7 +370,6 @@ if __name__ == '__main__':
     constraint_primitive = lambda u: u * u
 
     # initialize everything
-    Omega = np.random.normal(size=(test_n, R))
     if hparams.warm_start_mode == 'none':
         S = np.zeros((test_n, R))
         z = np.zeros((test_n,))
@@ -359,7 +382,7 @@ if __name__ == '__main__':
 
         X_factorized = U * np.sqrt(Lambda)[None, :]
 
-        S = X_factorized @ (X_factorized.T @ Omega)
+        S = X_factorized @ (X_factorized.T @ Omega[:test_n,:])
         z = np.sum(X_factorized * X_factorized, axis=1)
         y = np.zeros((test_n,))
         y[:warm_start_n] = warm_start_result_dict['y']
@@ -369,7 +392,7 @@ if __name__ == '__main__':
     # get test result
     test_result_dict = sketchy_cgal(
             S,
-            Omega,
+            Omega[:test_n,:],
             z,
             b,
             y,
