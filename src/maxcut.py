@@ -151,7 +151,11 @@ def sketchy_cgal(
                     - tau * (sigma_init / sigma)
                         * np.max([np.abs(min_eigen_val), np.abs(max_eigen_val)])
             )
-            best_obj_lb = np.max([obj_lb, best_obj_lb])
+            #obj_lb = obj_val - sub_opt
+            if t > 0:
+                best_obj_lb = np.max([obj_lb, best_obj_lb])
+            else:
+                best_obj_lb = obj_lb
             lb_gap = aug_lagrangian - best_obj_lb
 
             if warm_start_mode in ['none', 'just_data']:
@@ -160,7 +164,7 @@ def sketchy_cgal(
                 break
 
             # binary search for sigma here
-            approx_step_num = 4 / sub_opt
+            approx_step_num = 4 / lb_gap
 
             # can never go back in time
             if approx_step_num < step_num:
@@ -172,8 +176,6 @@ def sketchy_cgal(
 
             if warm_start_mode in ['static', 'dynamic'] and sigma_gap < 1e-2:
                 step_num = approx_step_num
-                embed()
-                exit()
                 break
 
         if (t > 0 and t % eval_freq == 0) or (lb_gap < CONVERGE_EPS
@@ -228,6 +230,7 @@ def sketchy_cgal(
             'infeas': np.linalg.norm(infeas, 2),
             'soln_quality': soln_quality,
             'sigma': sigma,
+            'obj_val': obj_val,
     }
 
     return result_dict
@@ -376,8 +379,14 @@ if __name__ == '__main__':
         y = np.zeros((test_n,))
         obj_val = 0.0
     else:
-        U = np.zeros((test_n, R))
-        U[:warm_start_n, :] = warm_start_result_dict['U']
+        # expand U randomly
+        warm_start_U = warm_start_result_dict['U']
+        random_indices = np.random.choice(warm_start_U.shape[0],
+                                          test_n - warm_start_n,
+                                          replace=True)
+        U = np.concatenate([warm_start_U, warm_start_U[random_indices]])
+        U = U / np.linalg.norm(U, axis=0)[None,:]
+
         Lambda = warm_start_result_dict['Lambda']
 
         X_factorized = U * np.sqrt(Lambda)[None, :]
