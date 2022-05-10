@@ -15,7 +15,7 @@ from IPython import embed
 
 
 APPROX_EPS = 1e-4   # for numerical operations
-CONVERGE_EPS = 1e-3 # for measuring convergence
+CONVERGE_EPS = 1e-4 # for measuring convergence
 
 
 def solve_maxcut_slow(L: csc_matrix) -> np.array:
@@ -50,7 +50,7 @@ def approx_extreme_eigen(
         if i > 0:
             V[i+1] -= (rhos[i-1] * V[i-1])
         rhos[i] = np.linalg.norm(V[i+1])
-        if rhos[i] < np.sqrt(n) * APPROX_EPS: 
+        if rhos[i] < APPROX_EPS: 
             break
         V[i+1] = V[i+1] / rhos[i]
 
@@ -114,10 +114,8 @@ def sketchy_cgal(
 
     if warm_start_mode == 'none':
         step_num = 0.0
-    elif warm_start_mode == 'just_data':
-        step_num = 1.0
     else:
-        step_num = 2.0
+        step_num = 600.0
 
     for t in range(T):
         sigma = sigma_init * np.sqrt(step_num + 2)
@@ -148,39 +146,43 @@ def sketchy_cgal(
                     aug_lagrangian
                     + obj_update - obj_val + np.dot(y + sigma * (infeas), h - z)
                     + 0.5*sigma*(np.linalg.norm(infeas)**2)
-                    - tau * (sigma_init / sigma)
-                        * np.max([np.abs(min_eigen_val), np.abs(max_eigen_val)])
+                    #- tau * (sigma_init / sigma)
+                    #    * np.max([np.abs(min_eigen_val), np.abs(max_eigen_val)])
             )
             if t > 0:
                 best_obj_lb = np.max([obj_lb, best_obj_lb])
             else:
                 best_obj_lb = np.max([obj_lb])
-            lb_gap = aug_lagrangian - best_obj_lb
+            #lb_gap = aug_lagrangian - best_obj_lb
+            lb_gap = aug_lagrangian - obj_lb
+
+            # binary search for sigma here
+            approx_step_num = 0.1 / lb_gap
+
+            step_num = approx_step_num
 
             if warm_start_mode in ['none', 'just_data']:
                 break
             if warm_start_mode == 'static' and t > 0:
                 break
 
-            # binary search for sigma here
-            approx_step_num = 4 / lb_gap
-
-            # can never go back in time
-            if approx_step_num < step_num:
-                break
-            
             approx_sigma = sigma_init * np.sqrt(approx_step_num + 2)
             sigma_gap = np.abs(approx_sigma - sigma)
             sigma += (approx_sigma - sigma) / 2
 
             if warm_start_mode in ['static', 'dynamic'] and sigma_gap < 1e-2:
+                # can never go back in time
+                if approx_step_num < step_num:
+                    break
+            
                 step_num = approx_step_num
                 break
 
-        if (t > 0 and t % eval_freq == 0) or (lb_gap < CONVERGE_EPS
+        if ((t > 0 or warm_start_mode != 'none') and t % eval_freq == 0) or (sub_opt < CONVERGE_EPS
                 and np.linalg.norm(infeas, 2) < CONVERGE_EPS):
             print('t = ', t)
             print('step_num = ', step_num)
+            print('approx_step_num = ', approx_step_num)
             print('infeas = ', np.linalg.norm(infeas, 2))
             print('obj val = ', obj_val)
             print('dual gap = ', dual_gap)
@@ -189,6 +191,7 @@ def sketchy_cgal(
             print('obj lb = ', obj_lb)
             print('best obj lb = ', best_obj_lb)
             print('lb gap = ', lb_gap)
+            print('y_norm = ', np.linalg.norm(y))
 
             U, Lambda = reconstruct(Omega, S)
             Lambda_tr_correct = Lambda + (tau - np.sum(Lambda)) / R
@@ -198,7 +201,7 @@ def sketchy_cgal(
 
             print()
 
-            if (lb_gap < CONVERGE_EPS
+            if (sub_opt < CONVERGE_EPS
                     and np.linalg.norm(infeas, 2) < CONVERGE_EPS):
                 break
 
@@ -278,8 +281,8 @@ if __name__ == '__main__':
 
     hparams = get_hparams()
 
-    R = 25
-    T = int(1e4)
+    R = 100
+    T = int(1e6)
     eval_freq = 100
 
     np.random.seed(hparams.seed)
@@ -305,12 +308,12 @@ if __name__ == '__main__':
     tau = warm_start_n
 
     # scaling params
-    scale_C = 1.0/np.linalg.norm(C.data) # equivalent to frobenius norm
-    scale_X = 1.0/warm_start_n
+    warm_start_scale_C = 1.0/np.linalg.norm(C.data) # equivalent to frobenius norm
+    warm_start_scale_X = 1.0/warm_start_n
 
-    C *= scale_C
-    b *= scale_X
-    tau *= scale_X
+    C *= warm_start_scale_C
+    b *= warm_start_scale_X
+    tau *= warm_start_scale_X
 
     # define the primitives
     objective_primitive = lambda u: (C @ u)
@@ -324,26 +327,35 @@ if __name__ == '__main__':
 
     obj_val = 0.0
 
-    # get warm-start result
-    warm_start_result_dict = sketchy_cgal(
-            S,
-            Omega[:warm_start_n,:],
-            z,
-            b,
-            y,
-            objective_primitive,
-            adjoint_constraint_primitive,
-            constraint_primitive,
-            obj_val,
-            R,
-            T,
-            soln_quality_callback,
-            eval_freq,
-            warm_start_mode='none'
-    )
+    ## get warm-start result
+    #warm_start_result_dict = sketchy_cgal(
+    #        S,
+    #        Omega[:warm_start_n,:],
+    #        z,
+    #        b,
+    #        y,
+    #        objective_primitive,
+    #        adjoint_constraint_primitive,
+    #        constraint_primitive,
+    #        obj_val,
+    #        R,
+    #        T,
+    #        soln_quality_callback,
+    #        eval_freq,
+    #        warm_start_mode='none'
+    #)
 
-    if hparams.test_data_frac == hparams.warm_start_data_frac:
-        exit()
+    #embed()
+    #exit()
+
+    #with open('G63_warm_start_6999_R-2.pkl', 'rb') as f:
+    #    warm_start_result_dict = pickle.load(f)
+    #with open('G63_warm_start_6979_R-2.pkl', 'rb') as f:
+    #    warm_start_result_dict = pickle.load(f)
+    #with open('G63_warm_start_6930_R-2.pkl', 'rb') as f:
+    #    warm_start_result_dict = pickle.load(f)
+    with open('G63_warm_start_6930_R-100.pkl', 'rb') as f:
+        warm_start_result_dict = pickle.load(f)
 
     # test with warm start mode
     test_n = int(hparams.test_data_frac * n)
@@ -359,12 +371,12 @@ if __name__ == '__main__':
     tau = test_n
 
     # scaling params
-    scale_C = 1.0/np.linalg.norm(C.data) # equivalent to frobenius norm
-    scale_X = 1.0/test_n
+    test_scale_C = 1.0/np.linalg.norm(C.data) # equivalent to frobenius norm
+    test_scale_X = 1.0/test_n
 
-    C *= scale_C
-    b *= scale_X
-    tau *= scale_X
+    C *= test_scale_C
+    b *= test_scale_X
+    tau *= test_scale_X
 
     # define the primitives
     objective_primitive = lambda u: (C @ u)
@@ -378,24 +390,21 @@ if __name__ == '__main__':
         y = np.zeros((test_n,))
         obj_val = 0.0
     else:
-        # expand U randomly
-        warm_start_U = warm_start_result_dict['U']
-        random_indices = np.random.choice(warm_start_U.shape[0],
-                                          test_n - warm_start_n,
-                                          replace=True)
-        U = np.concatenate([warm_start_U, warm_start_U[random_indices]])
-        U = U / np.linalg.norm(U, axis=0)[None,:]
-
-        Lambda = warm_start_result_dict['Lambda']
-
-        X_factorized = U * np.sqrt(Lambda)[None, :]
-
-        S = X_factorized @ (X_factorized.T @ Omega[:test_n,:])
-        z = np.sum(X_factorized * X_factorized, axis=1)
-        y = np.zeros((test_n,))
-        y[:warm_start_n] = warm_start_result_dict['y']
-
-        obj_val = np.trace(X_factorized.T @ (C @ X_factorized))
+        S = np.concatenate([
+            warm_start_result_dict['S'] * (test_scale_X / warm_start_scale_X),
+            test_scale_X * Omega[warm_start_n:test_n, :]
+        ])
+        z = np.concatenate([
+            warm_start_result_dict['z'] * (test_scale_X / warm_start_scale_X),
+            np.ones((test_n - warm_start_n,)) * test_scale_X
+        ])
+        y = np.concatenate([
+            warm_start_result_dict['y'] * (test_scale_X / warm_start_scale_X),
+            np.zeros((test_n - warm_start_n,))
+        ])
+        obj_val = (warm_start_result_dict['obj_val']
+                   * (test_scale_C / warm_start_scale_C)
+                   * (test_scale_X / warm_start_scale_X))
 
     # get test result
     test_result_dict = sketchy_cgal(
@@ -409,8 +418,8 @@ if __name__ == '__main__':
             constraint_primitive,
             obj_val,
             R,
-            T,
-            soln_quality_callback,
-            eval_freq,
+            T=T,
+            soln_quality_callback=soln_quality_callback,
+            eval_freq=100,
             warm_start_mode=hparams.warm_start_mode
     )
