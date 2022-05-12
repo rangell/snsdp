@@ -16,6 +16,7 @@ from IPython import embed
 
 APPROX_EPS = 1e-4   # for numerical operations
 CONVERGE_EPS = 1e-4 # for measuring convergence
+FIXED_POINT_TOLERANCE = 1e-1
 
 
 def solve_maxcut_slow(L: csc_matrix) -> np.array:
@@ -101,27 +102,32 @@ def sketchy_cgal(
         T: int,
         soln_quality_callback: Callable[[np.ndarray, np.array], int],
         eval_freq: int,
-        warm_start_mode: str) -> np.array:
+        step_size_mode: str,
+        warm_start: bool) -> np.array:
 
-    assert warm_start_mode in ['none', 'just_data', 'static', 'dynamic']
+    assert step_size_mode in ['std', 'static', 'dynamic']
 
     n = z.shape[0]
 
     best_obj_lb = -np.inf
+    best_curve_est = 0.0
     sigma_init = 1.0
 
     start_time = time.time()
 
-    if warm_start_mode == 'none':
+    if not warm_start:
         step_num = 0.0
+    elif step_size_mode == 'std':
+        step_num = 1.0
     else:
-        step_num = 600.0
+        step_num = 1.0 # TODO: make this a parameter
 
     for t in range(T):
-        sigma = sigma_init * np.sqrt(step_num + 2)
-
         # determine eta and sigma (step-size and smoothing parameters)
         while True:
+            sigma = sigma_init * np.sqrt(step_num + 2)
+            eta = 2.0 / (step_num + 2.0)
+
             state_vec = y + sigma * (z-b)
             adjoint_closure = lambda u: adjoint_constraint_primitive(u, state_vec)
             num_iters = int(np.ceil((step_num+1)**(1/4) * np.log(n)))
@@ -149,40 +155,59 @@ def sketchy_cgal(
                     #- tau * (sigma_init / sigma)
                     #    * np.max([np.abs(min_eigen_val), np.abs(max_eigen_val)])
             )
+
             if t > 0:
                 best_obj_lb = np.max([obj_lb, best_obj_lb])
             else:
                 best_obj_lb = np.max([obj_lb])
-            #lb_gap = aug_lagrangian - best_obj_lb
+
+            # compute the essential gap for acceleration
             lb_gap = aug_lagrangian - obj_lb
 
-            # binary search for sigma here
-            approx_step_num = 0.1 / lb_gap
-
-            step_num = approx_step_num
-
-            if warm_start_mode in ['none', 'just_data']:
-                break
-            if warm_start_mode == 'static' and t > 0:
+            # just run the prestart step or standard fixed schedule step size
+            if (not warm_start and t < 2) or step_size_mode == 'std':
                 break
 
-            approx_sigma = sigma_init * np.sqrt(approx_step_num + 2)
-            sigma_gap = np.abs(approx_sigma - sigma)
-            sigma += (approx_sigma - sigma) / 2
-
-            if warm_start_mode in ['static', 'dynamic'] and sigma_gap < 1e-2:
-                # can never go back in time
-                if approx_step_num < step_num:
-                    break
-            
-                step_num = approx_step_num
+            # only compute approx_step_num the first iteration
+            if step_size_mode == 'static' and t > 0:
                 break
 
-        if ((t > 0 or warm_start_mode != 'none') and t % eval_freq == 0) or (sub_opt < CONVERGE_EPS
+            if lb_gap < 0:
+                raise ValueError('lb_gap is negative!')
+
+            # compute curvature estimate and approximate step number
+            next_infeas = (1-eta) * z + eta * h - b
+            next_aug_lagrangian = (
+                    (1-eta) * obj_val + eta * obj_update
+                    + np.dot(y, next_infeas)
+                    + 0.5*sigma*(np.linalg.norm(next_infeas)**2)
+            )
+            linear_update_mag = eta * (obj_update - obj_val
+                                       + np.dot(y + sigma * (infeas), h - z))
+
+            curr_curve_est = (next_aug_lagrangian - aug_lagrangian
+                    - linear_update_mag) / (0.5 * eta**2 * sigma)
+            if curr_curve_est > best_curve_est:
+                best_curve_est = curr_curve_est
+
+            approx_step_num = 2 * best_curve_est / lb_gap
+
+            step_num_gap = (np.abs(approx_step_num - step_num)
+                            / np.max([approx_step_num, step_num]))
+
+            ## get to a fixed point
+            if step_num_gap < FIXED_POINT_TOLERANCE:
+                step_num = np.min([approx_step_num, step_num])
+                sigma = sigma_init * np.sqrt(step_num + 2)
+                eta = 2.0 / (step_num + 2.0)
+                break
+            step_num = (approx_step_num + step_num) / 2.0
+
+        if ((t > 0 or warm_start) and t % eval_freq == 0) or (sub_opt < CONVERGE_EPS
                 and np.linalg.norm(infeas, 2) < CONVERGE_EPS):
             print('t = ', t)
+            print('best_curve_est = ', best_curve_est)
             print('step_num = ', step_num)
-            print('approx_step_num = ', approx_step_num)
             print('infeas = ', np.linalg.norm(infeas, 2))
             print('obj val = ', obj_val)
             print('dual gap = ', dual_gap)
@@ -201,11 +226,9 @@ def sketchy_cgal(
 
             print()
 
-            if (sub_opt < CONVERGE_EPS
+            if (t > 10 and sub_opt < CONVERGE_EPS
                     and np.linalg.norm(infeas, 2) < CONVERGE_EPS):
                 break
-
-        eta = 2 / (step_num + 2.0)
 
         # update state variables
         z = (1-eta) * z + eta * h 
@@ -218,7 +241,6 @@ def sketchy_cgal(
 
         # increment step number
         step_num += 1
-
 
     result_dict = {
             'U': U,
@@ -254,9 +276,11 @@ def get_hparams():
     parser.add_argument('--test_data_frac', type=float, default=1.0,
                         help="fraction of data to use to test warm start")
 
-    parser.add_argument('--warm_start_mode', type=str, default='just_data',
-                        choices=['none', 'just_data', 'static', 'dynamic'],
-                        help="fraction of data to use to test warm start")
+    parser.add_argument('--warm_start', action=argparse.BooleanOptionalAction,
+                        help="whether or not to warm start")
+    parser.add_argument('--step_size_mode', type=str, default='std',
+                        choices=['std', 'static', 'dynamic'],
+                        help="step size mode for optimization")
 
     hparams = parser.parse_args()
     return hparams
@@ -281,7 +305,7 @@ if __name__ == '__main__':
 
     hparams = get_hparams()
 
-    R = 100
+    R = 2
     T = int(1e6)
     eval_freq = 100
 
@@ -327,26 +351,27 @@ if __name__ == '__main__':
 
     obj_val = 0.0
 
-    ## get warm-start result
-    #warm_start_result_dict = sketchy_cgal(
-    #        S,
-    #        Omega[:warm_start_n,:],
-    #        z,
-    #        b,
-    #        y,
-    #        objective_primitive,
-    #        adjoint_constraint_primitive,
-    #        constraint_primitive,
-    #        obj_val,
-    #        R,
-    #        T,
-    #        soln_quality_callback,
-    #        eval_freq,
-    #        warm_start_mode='none'
-    #)
+    # get warm-start result
+    warm_start_result_dict = sketchy_cgal(
+            S,
+            Omega[:warm_start_n,:],
+            z,
+            b,
+            y,
+            objective_primitive,
+            adjoint_constraint_primitive,
+            constraint_primitive,
+            obj_val,
+            R,
+            T,
+            soln_quality_callback,
+            eval_freq,
+            step_size_mode=hparams.step_size_mode,
+            warm_start=False
+    )
 
-    #embed()
-    #exit()
+    embed()
+    exit()
 
     #with open('G63_warm_start_6999_R-2.pkl', 'rb') as f:
     #    warm_start_result_dict = pickle.load(f)
@@ -354,8 +379,8 @@ if __name__ == '__main__':
     #    warm_start_result_dict = pickle.load(f)
     #with open('G63_warm_start_6930_R-2.pkl', 'rb') as f:
     #    warm_start_result_dict = pickle.load(f)
-    with open('G63_warm_start_6930_R-100.pkl', 'rb') as f:
-        warm_start_result_dict = pickle.load(f)
+    #with open('G63_warm_start_6930_R-100.pkl', 'rb') as f:
+    #    warm_start_result_dict = pickle.load(f)
 
     # test with warm start mode
     test_n = int(hparams.test_data_frac * n)
@@ -384,7 +409,7 @@ if __name__ == '__main__':
     constraint_primitive = lambda u: u * u
 
     # initialize everything
-    if hparams.warm_start_mode == 'none':
+    if not hparams.warm_start:
         S = np.zeros((test_n, R))
         z = np.zeros((test_n,))
         y = np.zeros((test_n,))
@@ -421,5 +446,6 @@ if __name__ == '__main__':
             T=T,
             soln_quality_callback=soln_quality_callback,
             eval_freq=100,
-            warm_start_mode=hparams.warm_start_mode
+            step_size_mode=hparams.step_size_mode,
+            warm_start=hparams.warm_start
     )
