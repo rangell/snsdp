@@ -3,6 +3,7 @@ Solve MaxCut sdp fast.
 """
 
 import argparse
+import json
 import logging
 import pickle
 import time
@@ -11,6 +12,7 @@ from typing import Callable, Dict, Tuple
 import cvxpy as cp
 import numpy as np
 from IPython import embed  # type: ignore
+from numpy.polynomial import Polynomial
 from scipy import io  # type: ignore
 from scipy.linalg import eigh_tridiagonal  # type: ignore
 from scipy.sparse import csc_matrix, csgraph  # type: ignore
@@ -99,6 +101,76 @@ def reconstruct(Omega: np.ndarray, S: np.ndarray) -> Tuple[np.ndarray, np.ndarra
     return U, Lambda
 
 
+def get_step_estimate_1(
+    aug_infeas_norm: float,
+    lagrangian_gap: float,
+    sigma_init: float,
+    best_curve_est: float,
+) -> float:
+    # solve order 3 polynomial for sigma_est
+    poly = Polynomial(
+        [
+            -2 * (sigma_init ** 2) * lagrangian_gap,
+            -2 * (sigma_init ** 2) * aug_infeas_norm - 2 * best_curve_est * sigma_init,
+            lagrangian_gap,
+            aug_infeas_norm,
+        ]
+    )
+    sigma_est = np.max(poly.roots())
+    assert sigma_est > 0
+    step_est = (sigma_est / sigma_init) ** 2 - 2
+    return step_est
+
+
+def get_step_estimate_2(
+    aug_infeas_norm: float,
+    lagrangian_gap: float,
+    sigma_init: float,
+    best_curve_est: float,
+) -> float:
+    # solve order 3 polynomial for sigma_est
+    poly = Polynomial(
+        [
+            -2 * (sigma_init ** 2) * lagrangian_gap - 2 * best_curve_est * sigma_init,
+            -2 * (sigma_init ** 2) * aug_infeas_norm,
+            lagrangian_gap,
+            aug_infeas_norm,
+        ]
+    )
+    sigma_est = np.max(poly.roots())
+    assert sigma_est.imag == 0.0
+    sigma_est = sigma_est.real
+    assert sigma_est > 0
+    step_est = (sigma_est / sigma_init) ** 2 - 2
+    return step_est
+
+
+def get_step_estimate_4(
+    aug_infeas_norm: float,
+    lagrangian_gap: float,
+    sigma_init: float,
+    best_curve_est: float,
+) -> float:
+    # solve order 5 polynomial for sigma_est
+    poly = Polynomial(
+        [
+            4 * (sigma_init ** 4) * lagrangian_gap,
+            4 * (sigma_init ** 4) * aug_infeas_norm,
+            -4 * best_curve_est * (sigma_init ** 4)
+            - 4 * (sigma_init ** 2) * lagrangian_gap,
+            -4 * (sigma_init ** 2) * aug_infeas_norm,
+            lagrangian_gap,
+            aug_infeas_norm,
+        ]
+    )
+    sigma_est = np.max(poly.roots())
+    assert sigma_est.imag == 0.0
+    sigma_est = sigma_est.real
+    assert sigma_est > 0
+    step_est = (sigma_est / sigma_init) ** 2 - 2
+    return step_est
+
+
 def sketchy_cgal(
     logger: logging.Logger,
     S: np.ndarray,
@@ -121,6 +193,7 @@ def sketchy_cgal(
 ) -> Dict:
 
     assert step_size_mode in ["std", "static", "dynamic"]
+    assert not (step_size_mode == "static" and not warm_start)
 
     n = z.shape[0]
 
@@ -141,23 +214,97 @@ def sketchy_cgal(
     for t in range(T):
         sigma = sigma_init * np.sqrt(step_num + 2)
         eta = 2.0 / (step_num + 2.0)
+        infeas = z - b
 
-        state_vec = y + sigma * (z - b)
+        # need initial `best_obj_lb` and `best_curve_est` for either
+        # "static" or "dynamic" warm-start
+        if t == 0 and warm_start and step_size_mode in ["static", "dynamic"]:
+            state_vec = y + sigma * infeas
+
+            def adjoint_closure(u: np.ndarray) -> np.ndarray:
+                return adjoint_constraint_primitive(u, state_vec)
+
+            num_iters = int((np.ceil((step_num + 1) ** (1 / 4)) * np.log(n)))
+
+            # compute primal update direction via randomized Lanczos
+            min_eigen_val, min_eigen_vec, max_eigen_val, _ = approx_extreme_eigen(
+                objective_primitive, adjoint_closure, n, num_iters
+            )
+            h = tau * constraint_primitive(min_eigen_vec)
+            obj_update = tau * np.dot(min_eigen_vec, objective_primitive(min_eigen_vec))
+
+            # compute objective lower bound
+            aug_lagrangian = (
+                obj_val
+                + np.dot(y, infeas)
+                + 0.5 * sigma * (np.linalg.norm(infeas) ** 2)
+            )
+            obj_lb = (
+                aug_lagrangian
+                + obj_update
+                - obj_val
+                + np.dot(y + sigma * (infeas), h - z)
+                + 0.5 * sigma * (np.linalg.norm(infeas) ** 2)
+            )
+            best_obj_lb = np.max([obj_lb, best_obj_lb])
+
+            # compute curvature estimate
+            next_infeas = (1 - eta) * z + eta * h - b
+            next_aug_lagrangian = (
+                (1 - eta) * obj_val
+                + eta * obj_update
+                + np.dot(y, next_infeas)
+                + 0.5 * sigma * (np.linalg.norm(next_infeas) ** 2)
+            )
+            linear_update_mag = eta * (
+                obj_update - obj_val + np.dot(y + sigma * (infeas), h - z)
+            )
+
+            curr_curve_est = (
+                next_aug_lagrangian - aug_lagrangian - linear_update_mag
+            ) / (0.5 * eta ** 2 * sigma)
+            if curr_curve_est > best_curve_est:
+                best_curve_est = curr_curve_est
+
+        # compute accelerated pseudo step num
+        if (t == 0 and step_size_mode == "static") or (
+            (t > 1 or warm_start) and step_size_mode == "dynamic"
+        ):
+            rescale_infeas = infeas / scale_X
+            rescale_y = y / scale_X
+            rescale_obj_val = obj_val / (scale_X * scale_C)
+            rescale_best_obj_lb = best_obj_lb / (scale_X * scale_C)
+
+            aug_infeas_norm = 0.5 * (np.linalg.norm(rescale_infeas) ** 2)
+            lagrangian_gap = (
+                rescale_obj_val
+                + np.dot(rescale_y, rescale_infeas)
+                - rescale_best_obj_lb
+            )
+
+            step_num = get_step_estimate_4(
+                aug_infeas_norm,
+                lagrangian_gap,
+                sigma_init,
+                curr_curve_est / (scale_X ** 2),
+            )
+            sigma = sigma_init * np.sqrt(step_num + 2.0)
+            eta = 2.0 / (step_num + 2.0)
+
+        # compute primal update direction via randomized Lanczos
+        state_vec = y + sigma * infeas
 
         def adjoint_closure(u: np.ndarray) -> np.ndarray:
             return adjoint_constraint_primitive(u, state_vec)
 
         num_iters = int((np.ceil((step_num + 1) ** (1 / 4)) * np.log(n)))
 
-        # compute primal update direction via randomized Lanczos
         min_eigen_val, min_eigen_vec, max_eigen_val, _ = approx_extreme_eigen(
             objective_primitive, adjoint_closure, n, num_iters
         )
         h = tau * constraint_primitive(min_eigen_vec)
         obj_update = tau * np.dot(min_eigen_vec, objective_primitive(min_eigen_vec))
 
-        # for dynamic step-size selection
-        infeas = z - b
         aug_lagrangian = (
             obj_val + np.dot(y, infeas) + 0.5 * sigma * (np.linalg.norm(infeas) ** 2)
         )
@@ -170,23 +317,24 @@ def sketchy_cgal(
         )
         best_obj_lb = np.max([obj_lb, best_obj_lb])
 
-        # compute curvature estimate and approximate step number
-        next_infeas = (1 - eta) * z + eta * h - b
-        next_aug_lagrangian = (
-            (1 - eta) * obj_val
-            + eta * obj_update
-            + np.dot(y, next_infeas)
-            + 0.5 * sigma * (np.linalg.norm(next_infeas) ** 2)
-        )
-        linear_update_mag = eta * (
-            obj_update - obj_val + np.dot(y + sigma * (infeas), h - z)
-        )
+        # compute curvature estimate
+        if step_size_mode == "dynamic":
+            next_infeas = (1 - eta) * z + eta * h - b
+            next_aug_lagrangian = (
+                (1 - eta) * obj_val
+                + eta * obj_update
+                + np.dot(y, next_infeas)
+                + 0.5 * sigma * (np.linalg.norm(next_infeas) ** 2)
+            )
+            linear_update_mag = eta * (
+                obj_update - obj_val + np.dot(y + sigma * (infeas), h - z)
+            )
 
-        curr_curve_est = (next_aug_lagrangian - aug_lagrangian - linear_update_mag) / (
-            0.5 * eta ** 2 * sigma
-        )
-        if curr_curve_est > best_curve_est:
-            best_curve_est = curr_curve_est
+            curr_curve_est = (
+                next_aug_lagrangian - aug_lagrangian - linear_update_mag
+            ) / (0.5 * eta ** 2 * sigma)
+            if curr_curve_est > best_curve_est:
+                best_curve_est = curr_curve_est
 
         # compute metrics and check for convergence
         if t > 0 and t % eval_freq == 0:
@@ -205,7 +353,8 @@ def sketchy_cgal(
             soln_quality = soln_quality_callback(U, Lambda_tr_correct)
 
             metrics = {
-                "infeas": np.linalg.norm(infeas / scale_X, 2),
+                "step_num": step_num,
+                "infeas": np.linalg.norm(rescale_infeas, 2),
                 "obj_val": rescale_obj_val,
                 "best_obj_lb": rescale_best_obj_lb,
                 "aug_prob_gap": aug_prob_gap,
@@ -352,9 +501,16 @@ if __name__ == "__main__":
     # create logger
     logger = create_logger(hparams.output_dir, hparams.debug)
 
+    # TODO: move these to hparams
     R = 25
     T = int(1e6)
     eval_freq = 100
+
+    logger.info(
+        "Experiment args:\n{}".format(
+            json.dumps(vars(hparams), sort_keys=True, indent=4)
+        )
+    )
 
     np.random.seed(hparams.seed)
 
@@ -392,6 +548,8 @@ if __name__ == "__main__":
 
     obj_val = 0.0
 
+    logger.warning('USING "dynamic" FOR COMPUTING WARM-START RESULT')
+
     # get warm-start result
     warm_start_result_dict = sketchy_cgal(
         logger,
@@ -410,24 +568,22 @@ if __name__ == "__main__":
         T=T,
         soln_quality_callback=soln_quality_callback_closure(warm_start_laplacian, R),
         eval_freq=100,
-        step_size_mode="std",
+        step_size_mode="dynamic",
         warm_start=False,
     )
 
-    with open("SCS_G22_X.pkl", "rb") as f:
-        X_opt = pickle.load(f)
-
-    S_opt = X_opt @ Omega
-    U_opt, Lambda_opt = reconstruct(Omega, S_opt)
-    Lambda_tr_correct = Lambda_opt + (tau - np.sum(Lambda_opt)) / R
-    opt_soln_quality = soln_quality_callback_closure(warm_start_laplacian, R)(
-        U_opt, Lambda_tr_correct
-    )
-
-    logger.info("Optimal sketched solution quality: %d", opt_soln_quality)
-
     embed()
     exit()
+
+    # with open("SCS_G22_X.pkl", "rb") as f:
+    #    X_opt = pickle.load(f)
+    # S_opt = X_opt @ Omega
+    # U_opt, Lambda_opt = reconstruct(Omega, S_opt)
+    # Lambda_tr_correct = Lambda_opt + (tau - np.sum(Lambda_opt)) / R
+    # opt_soln_quality = soln_quality_callback_closure(warm_start_laplacian, R)(
+    #    U_opt, Lambda_tr_correct
+    # )
+    # logger.info("Optimal sketched solution quality: %d", opt_soln_quality)
 
     # with open('G63_warm_start_6999_R-2.pkl', 'rb') as f:
     #    warm_start_result_dict = pickle.load(f)
