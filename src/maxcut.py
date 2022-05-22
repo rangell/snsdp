@@ -102,16 +102,13 @@ def reconstruct(Omega: np.ndarray, S: np.ndarray) -> Tuple[np.ndarray, np.ndarra
 
 
 def get_step_estimate_1(
-    aug_infeas_norm: float,
-    lagrangian_gap: float,
-    sigma_init: float,
-    best_curve_est: float,
+    aug_infeas_norm: float, lagrangian_gap: float, sigma_init: float, curve_est: float,
 ) -> float:
     # solve order 3 polynomial for sigma_est
     poly = Polynomial(
         [
             -2 * (sigma_init ** 2) * lagrangian_gap,
-            -2 * (sigma_init ** 2) * aug_infeas_norm - 2 * best_curve_est * sigma_init,
+            -2 * (sigma_init ** 2) * aug_infeas_norm - 2 * curve_est * sigma_init,
             lagrangian_gap,
             aug_infeas_norm,
         ]
@@ -123,15 +120,12 @@ def get_step_estimate_1(
 
 
 def get_step_estimate_2(
-    aug_infeas_norm: float,
-    lagrangian_gap: float,
-    sigma_init: float,
-    best_curve_est: float,
+    aug_infeas_norm: float, lagrangian_gap: float, sigma_init: float, curve_est: float,
 ) -> float:
     # solve order 3 polynomial for sigma_est
     poly = Polynomial(
         [
-            -2 * (sigma_init ** 2) * lagrangian_gap - 2 * best_curve_est * sigma_init,
+            -2 * (sigma_init ** 2) * lagrangian_gap - 2 * curve_est * sigma_init,
             -2 * (sigma_init ** 2) * aug_infeas_norm,
             lagrangian_gap,
             aug_infeas_norm,
@@ -146,18 +140,14 @@ def get_step_estimate_2(
 
 
 def get_step_estimate_4(
-    aug_infeas_norm: float,
-    lagrangian_gap: float,
-    sigma_init: float,
-    best_curve_est: float,
+    aug_infeas_norm: float, lagrangian_gap: float, sigma_init: float, curve_est: float,
 ) -> float:
     # solve order 5 polynomial for sigma_est
     poly = Polynomial(
         [
             4 * (sigma_init ** 4) * lagrangian_gap,
             4 * (sigma_init ** 4) * aug_infeas_norm,
-            -4 * best_curve_est * (sigma_init ** 4)
-            - 4 * (sigma_init ** 2) * lagrangian_gap,
+            -4 * curve_est * (sigma_init ** 4) - 4 * (sigma_init ** 2) * lagrangian_gap,
             -4 * (sigma_init ** 2) * aug_infeas_norm,
             lagrangian_gap,
             aug_infeas_norm,
@@ -190,6 +180,7 @@ def sketchy_cgal(
     eval_freq: int,
     step_size_mode: str,
     warm_start: bool,
+    extra_args: Dict,
 ) -> Dict:
 
     assert step_size_mode in ["std", "static", "dynamic"]
@@ -282,12 +273,33 @@ def sketchy_cgal(
                 - rescale_best_obj_lb
             )
 
-            step_num = get_step_estimate_4(
-                aug_infeas_norm,
-                lagrangian_gap,
-                sigma_init,
-                curr_curve_est / (scale_X ** 2),
-            )
+            if extra_args["curve_est"] == "best":
+                curve_est = best_curve_est
+            else:
+                assert extra_args["curve_est"] == "curr"
+                curve_est = curr_curve_est
+
+            if extra_args["step_est"] == 1:
+                step_num = get_step_estimate_1(
+                    aug_infeas_norm,
+                    lagrangian_gap,
+                    sigma_init,
+                    curve_est / (scale_X ** 2),
+                )
+            elif extra_args["step_est"] == 2:
+                step_num = get_step_estimate_2(
+                    aug_infeas_norm,
+                    lagrangian_gap,
+                    sigma_init,
+                    curve_est / (scale_X ** 2),
+                )
+            elif extra_args["step_est"] == 4:
+                step_num = get_step_estimate_4(
+                    aug_infeas_norm,
+                    lagrangian_gap,
+                    sigma_init,
+                    curve_est / (scale_X ** 2),
+                )
             sigma = sigma_init * np.sqrt(step_num + 2.0)
             eta = 2.0 / (step_num + 2.0)
 
@@ -502,6 +514,10 @@ if __name__ == "__main__":
     logger = create_logger(hparams.output_dir, hparams.debug)
 
     # TODO: move these to hparams
+    SCALE_PROBLEM_DATA = True  # TODO: make this a command line arg?
+    CURVE_EST = "curr"
+    STEP_EST = 4
+
     R = 25
     T = int(1e6)
     eval_freq = 100
@@ -534,8 +550,12 @@ if __name__ == "__main__":
     tau = float(warm_start_n)
 
     # scaling params
-    warm_start_scale_C = 1.0 / np.linalg.norm(C.data)  # equivalent to frobenius norm
-    warm_start_scale_X = 1.0 / warm_start_n
+    if SCALE_PROBLEM_DATA:
+        warm_start_scale_C = 1.0 / np.linalg.norm(C.data)
+        warm_start_scale_X = 1.0 / warm_start_n
+    else:
+        warm_start_scale_C = 1.0
+        warm_start_scale_X = 1.0
 
     C *= warm_start_scale_C
     b *= warm_start_scale_X
@@ -549,6 +569,7 @@ if __name__ == "__main__":
     obj_val = 0.0
 
     logger.warning('USING "dynamic" FOR COMPUTING WARM-START RESULT')
+    extra_args = {"curve_est": CURVE_EST, "step_est": STEP_EST}
 
     # get warm-start result
     warm_start_result_dict = sketchy_cgal(
@@ -570,6 +591,7 @@ if __name__ == "__main__":
         eval_freq=100,
         step_size_mode="dynamic",
         warm_start=False,
+        extra_args=extra_args,
     )
 
     embed()
